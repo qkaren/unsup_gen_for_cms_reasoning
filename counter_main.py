@@ -104,6 +104,7 @@ def get_text_from_logits(logits, tokenizer, temperature=1.0, top_k=1):
         output_so_far = last if output_so_far is None else torch.cat((output_so_far, last), dim=1)
 
     text = tokenizer.decode(output_so_far.tolist()[0])
+    text = text.replace('\n', ' ')
     #print(text)
 
     return text
@@ -356,48 +357,30 @@ def generate_text(
 
     ## The 1st left-to-right pass
 
-    past = None
-    last_embeds = None
-    logits_so_far = None
-    for i in range(length):
+    # Get past/probs for current output, except for last word
+    # Note that GPT takes 2 inputs: past + current_token
 
-        # Get past/probs for current output, except for last word
-        # Note that GPT takes 2 inputs: past + current_token
+    # run model forward to obtain unperturbed
+    unpert_logits, _, _ = model(torch.cat([o1_t, o2_t], dim=-1))
+    o2_length = o2_t.shape[1]
+    o2_logits = unpert_logits[:, -o2_length-1:-1, :] # TODO(h): exclude the last step (which is a prediction)
+    assert unpert_logits.shape[1] == o1_t.shape[1] + o2_length
+    assert o2_logits.shape[1] == o2_length
 
-        # run model forward to obtain unperturbed
-        if past is None and output_so_far is not None:
-            last = output_so_far[:, -1:]
-            last_embeds = model.get_input_embeddings()(last)
+    # O2 loss
+    loss = torch.nn.CrossEntropyLoss()(o2_logits.view(-1, o2_logits.size(-1)), o2_t.view(-1))
+    print("[First pass] o2 loss: ", loss.data.cpu().numpy())
 
-            if output_so_far.shape[1] > 1:
-                _, past, _ = model(output_so_far[:, :-1])
-
-        unpert_logits, past, unpert_all_hidden = model(past=past, inputs_embeds=last_embeds)
-        unpert_logits = unpert_logits[:, -1, :] / temperature_first  # + SMALL_CONST
-        unpert_logits = unpert_logits.unsqueeze(1)
-        logits_so_far = unpert_logits if logits_so_far is None else torch.cat((logits_so_far, unpert_logits), dim=1)
-
-        last_embeds = get_input_embeds(model.get_input_embeddings(), unpert_logits, device=device)
-
-    print("[First pass]: ", get_text_from_logits(logits_so_far, tokenizer, temperature=1.0, top_k=top_k))
-
-    #unpert_logits, unpert_past, unpert_all_hidden = model(output_so_far)
-    #unpert_logits_h = unpert_logits[:, -length-1:-1, :] # logits of tokens in h
-    unpert_logits_h = logits_so_far
-
-    #print("o1 length: ", o1_t.shape[1])
-    #print("logits length: ", unpert_logits.shape[1])
-    #print("logits_h length: ", unpert_logits_h.shape[1])
-    #print("length: ", length)
-    #print("length output_so_far: ", output_so_far.shape[1])
+    #print("[First pass]: ", get_text_from_logits(logits_so_far, tokenizer, temperature=1.0, top_k=top_k))
 
 
     ## Iteratively perturb the generation
 
     if perturb_o1:
-        pert_logits = torch.cat((o1_logits.to(device), unpert_logits_h), dim=1)
+        raise NotImplementedError
+        #pert_logits = torch.cat((o1_logits.to(device), unpert_logits_h), dim=1)
     else:
-        pert_logits = unpert_logits_h
+        pert_logits = o2_logits
     grad_norms = None
     for t in trange(num_passes, ascii=True):
 
@@ -405,23 +388,26 @@ def generate_text(
         print('Pass ', t)
         print("=" * 20)
 
-        ## Right-to-left perturbation
-        pert_logits, grad_norms, _ = perturb_right_to_left(
-            pert_logits,
-            #past,
-            model,
-            tokenizer,
-            o1_onehot=o1_onehot,
-            o2_onehot=o2_onehot,
-            o2=o2_t,
-            grad_norms=grad_norms,
-            stepsize=stepsize,
-            temperature=temperature_backward,
-            top_k=top_k,
-            num_iterations=num_iterations,
-            gamma=gamma,
-            device=device
-        )
+        if t == 0 and False: #TODO
+            pass
+        else:
+            ## Right-to-left perturbation
+            pert_logits, grad_norms, _ = perturb_right_to_left(
+                pert_logits,
+                #past,
+                model,
+                tokenizer,
+                o1_onehot=o1_onehot,
+                o2_onehot=o2_onehot,
+                o2=o2_t,
+                grad_norms=grad_norms,
+                stepsize=stepsize,
+                temperature=temperature_backward,
+                top_k=top_k,
+                num_iterations=num_iterations,
+                gamma=gamma,
+                device=device
+            )
 
         ## Left-to-right perturbation
         pert_logits = perturb_left_to_right(
@@ -431,7 +417,8 @@ def generate_text(
             o1_logits=o1_logits,
             o1_onehot=o1_onehot,
             o2_onehot=o2_onehot,
-            length=length,
+            #length=length,
+            length=o2_length,
             mix_rate=mix_rate,
             temperature=temperature_forward,
             top_k=top_k,
@@ -457,13 +444,12 @@ def perturb_left_to_right(
     device="cuda"
 ):
 
-    print(logits.shape)
-
     if perturb_o1:
-        o1_length = o1_logits.shape[1]
-        assert logits.shape[1] == o1_length + length
-        o1_logits = logits[:, :o1_length, :] # perturbed o1 logits
-        h_logits = logits[:, o1_length:, :]
+        raise NotImplementedError
+        #o1_length = o1_logits.shape[1]
+        #assert logits.shape[1] == o1_length + length
+        #o1_logits = logits[:, :o1_length, :] # perturbed o1 logits
+        #h_logits = logits[:, o1_length:, :]
     else:
         assert logits.shape[1] == length
         h_logits = logits
@@ -492,10 +478,11 @@ def perturb_left_to_right(
         pert_logits = pert_logits.unsqueeze(1)
         logits_so_far = pert_logits if logits_so_far is None else torch.cat((logits_so_far, pert_logits), dim=1)
 
-        last_embeds = get_input_embeds(model.get_input_embeddings(), pert_logits, device=device)
+        last_embeds = get_input_embeds(model.get_input_embeddings(), pert_logits / 0.1, device=device) #TODO
 
     if perturb_o1:
-        logits_so_far = torch.cat((o1_logits, logits_so_far), dim=1)
+        raise NotImplementedError
+        #logits_so_far = torch.cat((o1_logits, logits_so_far), dim=1)
 
     #output_so_far = o1
 
@@ -527,8 +514,6 @@ def perturb_left_to_right(
 
     print("[Forward]: ", get_text_from_logits(logits_so_far, tokenizer, temperature=1.0, top_k=top_k))
 
-    print(logits_so_far.shape)
-
     return logits_so_far
 
 
@@ -559,7 +544,7 @@ def perturb_right_to_left(
     # accumulate perturbations for num_iterations
     loss_per_iter = []
     for i in range(num_iterations):
-        print("Iteration ", i + 1)
+        print("\n-------Iteration------- ", i + 1)
         curr_perturbation = [
             to_var(torch.from_numpy(p_), requires_grad=True, device=device) for p_ in grad_accumulator
         ]
@@ -571,18 +556,33 @@ def perturb_right_to_left(
         perturbed_logits = list(map(add, logits, curr_perturbation))
         #perturbed_past = list(map(add, past, curr_perturbation_past))
 
-        inputs_embeds = get_input_embeds(model.get_input_embeddings(),
-                                         perturbed_logits[0] / temperature, # temperature
-                                         #o1_onehot=o1_onehot,
-                                         o2_onehot=o2_onehot,
-                                         device=device)
-        all_logits, _, _ = model(inputs_embeds=inputs_embeds)
-        o2_length = o2_onehot.shape[1]
-        o2_logits = all_logits[:, -o2_length-1:-1, :] # TODO(h): exclude the last step (which is a prediction)
-        assert o2_logits.shape[1] == o2_length
+        perturbed_logits_norms = [
+            torch.norm(p_, dim=-1) for index, p_ in enumerate(perturbed_logits)
+        ]
 
-        # O2 loss
-        loss = torch.nn.CrossEntropyLoss()(o2_logits.view(-1, o2_logits.size(-1)), o2.view(-1))
+        topk_lg, topk_index = torch.topk(perturbed_logits[0][0,-5,:], 5)
+        print(topk_lg.data.cpu().numpy())
+        print(topk_index.data.cpu().numpy())
+        print(perturbed_logits_norms[0][0,-5].data.cpu().numpy())
+        print('~'*20)
+
+        #inputs_embeds = get_input_embeds(model.get_input_embeddings(),
+        #                                 perturbed_logits[0] / temperature, # temperature
+        #                                 o1_onehot=o1_onehot,
+        #                                 #o2_onehot=o2_onehot,
+        #                                 device=device)
+        #all_logits, _, _ = model(inputs_embeds=inputs_embeds)
+        #o2_length = o2_onehot.shape[1]
+        #o2_logits = all_logits[:, -o2_length-1:-1, :] # TODO(h): exclude the last step (which is a prediction)
+        #assert all_logits.shape[1] == o1_onehot.shape[1] + o2_length
+        #assert o2_logits.shape[1] == o2_length
+
+        ## O2 loss
+        #loss_1 = torch.nn.CrossEntropyLoss()(o2_logits.view(-1, o2_logits.size(-1)), o2.view(-1))
+        loss_1 = 0
+
+        loss_2 = torch.nn.CrossEntropyLoss()(perturbed_logits[0].view(-1, perturbed_logits[0].size(-1)), o2.view(-1))
+        loss = 0.1 * loss_1 + loss_2
         print("o2 loss:", loss.data.cpu().numpy())
 
         loss_per_iter.append(loss.data.cpu().numpy())
@@ -591,21 +591,42 @@ def perturb_right_to_left(
         loss.backward()
 
         # calculate gradient norms
-        if grad_norms is not None:
+        if grad_norms is not None and False: # TODO
+            print('grad_norms 1')
             grad_norms = [
                 torch.max(grad_norms[index], torch.norm(p_.grad))
                 for index, p_ in enumerate(curr_perturbation)
             ]
         else:
+            print('grad_norms 2')
             grad_norms = [
-                (torch.norm(p_.grad) + SMALL_CONST) for index, p_ in enumerate(curr_perturbation)
+                (torch.norm(p_.grad, dim=-1) + SMALL_CONST) for index, p_ in enumerate(curr_perturbation)
             ]
 
-        # normalize gradients
+        # print(grad_norms[0][0,-5].data.cpu().numpy())
+        #
+        # topk_grad, topk_index = torch.topk(torch.abs(curr_perturbation[0].grad[0,-5,:]), 5)
+        # print(topk_grad.data.cpu().numpy())
+        # print(topk_index.data.cpu().numpy())
+
+        ## normalize gradients
+        #grad = [
+        #    -stepsize * (p_.grad / grad_norms[index] ** gamma).data.cpu().numpy()
+        #    for index, p_ in enumerate(curr_perturbation)
+        #]
+
         grad = [
-            -stepsize * (p_.grad / grad_norms[index] ** gamma).data.cpu().numpy()
+            -stepsize * (p_.grad / grad_norms[index].unsqueeze(-1) * perturbed_logits_norms[index].unsqueeze(-1)).data.cpu().numpy()
             for index, p_ in enumerate(curr_perturbation)
         ]
+
+        topk_grad, topk_index = torch.topk(torch.abs(torch.FloatTensor(grad[0])[0,-5,:]), 5)
+        print(topk_grad.data.cpu().numpy())
+        print(topk_index.data.cpu().numpy())
+        grad_temp_norms = [
+            torch.norm(torch.FloatTensor(p_), dim=-1) for index, p_ in enumerate(grad)
+        ]
+        print(grad_temp_norms[0][0,-5])
 
         # accumulate gradient
         grad_accumulator = list(map(add, grad, grad_accumulator))
