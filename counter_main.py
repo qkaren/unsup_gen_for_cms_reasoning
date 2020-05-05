@@ -129,7 +129,8 @@ def run_story_example(
     gamma=1.5,
     seed=0,
     no_cuda=False,
-    repetition_penalty=1.0
+    repetition_penalty=1.0,
+    verbose=False
 ):
     # set Random seed
     torch.manual_seed(seed)
@@ -159,9 +160,8 @@ def run_story_example(
     print(tokenizer.decode(tokenized_o2_text))
     print()
 
-    # generate unperturbed and perturbed texts
+    # generate perturbed texts
 
-    #unpert_gen_tok_text, _, _ = generate_text(
     generate_text(
         model=model,
         tokenizer=tokenizer,
@@ -182,7 +182,8 @@ def run_story_example(
         num_iterations=num_iterations,
         perturb_o1=perturb_o1,
         gamma=gamma,
-        repetition_penalty=repetition_penalty
+        repetition_penalty=repetition_penalty,
+        verbose=verbose
     )
     if device == "cuda":
         torch.cuda.empty_cache()
@@ -325,8 +326,11 @@ def generate_text(
     num_iterations=1,
     perturb_o1=False,
     gamma=1.5,
-    repetition_penalty=1.0
+    repetition_penalty=1.0,
+    verbose=False
 ):
+
+    ## Prepare one-hot representations for O1 O2
 
     output_so_far = None
     if o1:
@@ -355,10 +359,7 @@ def generate_text(
         o2_onehot.zero_()
         o2_onehot.scatter_(2, o2_t.unsqueeze(-1), 1)
 
-    ## The 1st left-to-right pass
-
-    # Get past/probs for current output, except for last word
-    # Note that GPT takes 2 inputs: past + current_token
+    ## The 1st left-to-right pass for initializing the generation (its logits)
 
     # run model forward to obtain unperturbed
     unpert_logits, _, _ = model(torch.cat([o1_t, o2_t], dim=-1))
@@ -369,12 +370,11 @@ def generate_text(
 
     # O2 loss
     loss = torch.nn.CrossEntropyLoss()(o2_logits.view(-1, o2_logits.size(-1)), o2_t.view(-1))
-    print("[First pass] o2 loss: ", loss.data.cpu().numpy())
+    if verbose:
+        print("[First pass] o2 loss: ", loss.data.cpu().numpy())
 
-    #print("[First pass]: ", get_text_from_logits(logits_so_far, tokenizer, temperature=1.0, top_k=top_k))
 
-
-    ## Iteratively perturb the generation
+    ## Iteratively perturb the generation through Forward and Backward passes
 
     if perturb_o1:
         raise NotImplementedError
@@ -382,14 +382,38 @@ def generate_text(
     else:
         pert_logits = o2_logits
     grad_norms = None
+
+
+    # Run several iterations of Backward so that the generation is initialized to
+    # be the original ending (O2)
+    pert_logits, grad_norms, _ = perturb_right_to_left( # TODO
+        pert_logits,
+        #past,
+        model,
+        tokenizer,
+        o1_onehot=o1_onehot,
+        o2_onehot=o2_onehot,
+        o2=o2_t,
+        grad_norms=grad_norms,
+        stepsize=stepsize,
+        temperature=temperature_backward,
+        top_k=top_k,
+        num_iterations=100,
+        gamma=gamma,
+        device=device,
+        verbose=verbose
+    )
+
+
     for t in trange(num_passes, ascii=True):
 
+        print()
         print("=" * 20)
         print('Pass ', t)
         print("=" * 20)
 
-        if t == 0 and False: #TODO
-            pass
+        if t == 0: #and False: #TODO
+            pass # Skip the Backward pass here because we've done Backward above
         else:
             ## Right-to-left perturbation
             pert_logits, grad_norms, _ = perturb_right_to_left(
@@ -406,10 +430,17 @@ def generate_text(
                 top_k=top_k,
                 num_iterations=num_iterations,
                 gamma=gamma,
-                device=device
+                device=device,
+                verbose=verbose
             )
 
         ## Left-to-right perturbation
+        if t < num_passes - 1:
+            fwd_length = o2_length
+        else:
+            fwd_length = o2_length * 2  # Generate long story ending in the last iteration so that
+                                        # we can get complete sentences.
+
         pert_logits = perturb_left_to_right(
             pert_logits,
             model,
@@ -418,12 +449,13 @@ def generate_text(
             o1_onehot=o1_onehot,
             o2_onehot=o2_onehot,
             #length=length,
-            length=o2_length,
+            length=fwd_length,
             mix_rate=mix_rate,
             temperature=temperature_forward,
             top_k=top_k,
             perturb_o1=perturb_o1,
-            device=device
+            device=device,
+            verbose=verbose
         )
 
     return output_so_far
@@ -441,7 +473,8 @@ def perturb_left_to_right(
     temperature=1.0,
     top_k=1,
     perturb_o1=False,
-    device="cuda"
+    device="cuda",
+    verbose=False
 ):
 
     if perturb_o1:
@@ -451,8 +484,12 @@ def perturb_left_to_right(
         #o1_logits = logits[:, :o1_length, :] # perturbed o1 logits
         #h_logits = logits[:, o1_length:, :]
     else:
-        assert logits.shape[1] == length
-        h_logits = logits
+        assert logits.shape[1] == length or logits.shape[1] == length / 2
+        if logits.shape[1] == length:
+            h_logits = logits
+        else:
+            h_logits = torch.cat((logits, torch.zeros_like(logits, device=device)), dim=1)
+
 
     past = None
     last_embeds = None
@@ -473,6 +510,7 @@ def perturb_left_to_right(
         unpert_logits, past, unpert_all_hidden = model(past=past, inputs_embeds=last_embeds)
         unpert_logits = unpert_logits[:, -1, :] / temperature  # + SMALL_CONST
 
+        # Mix backward logits and forward logits
         pert_logits = mix_rate * unpert_logits + (1-mix_rate) * h_logits[:,i,:]
 
         pert_logits = pert_logits.unsqueeze(1)
@@ -531,7 +569,8 @@ def perturb_right_to_left(
     top_k=1,
     num_iterations=3,
     gamma=1.5,
-    device="cuda"
+    device="cuda",
+    verbose=False
 ):
 
     # TODO(h): Set logits to a list to preserve the PPLM code structure
@@ -544,7 +583,8 @@ def perturb_right_to_left(
     # accumulate perturbations for num_iterations
     loss_per_iter = []
     for i in range(num_iterations):
-        print("\n-------Iteration------- ", i + 1)
+        if verbose:
+            print("\n-------Iteration------- ", i + 1)
         curr_perturbation = [
             to_var(torch.from_numpy(p_), requires_grad=True, device=device) for p_ in grad_accumulator
         ]
@@ -561,29 +601,33 @@ def perturb_right_to_left(
         ]
 
         topk_lg, topk_index = torch.topk(perturbed_logits[0][0,-5,:], 5)
-        print(topk_lg.data.cpu().numpy())
-        print(topk_index.data.cpu().numpy())
-        print(perturbed_logits_norms[0][0,-5].data.cpu().numpy())
-        print('~'*20)
+        if verbose:
+            print(topk_lg.data.cpu().numpy())
+            print(topk_index.data.cpu().numpy())
+            print(perturbed_logits_norms[0][0,-5].data.cpu().numpy())
+            print('~'*20)
 
-        #inputs_embeds = get_input_embeds(model.get_input_embeddings(),
-        #                                 perturbed_logits[0] / temperature, # temperature
-        #                                 o1_onehot=o1_onehot,
-        #                                 #o2_onehot=o2_onehot,
-        #                                 device=device)
-        #all_logits, _, _ = model(inputs_embeds=inputs_embeds)
-        #o2_length = o2_onehot.shape[1]
-        #o2_logits = all_logits[:, -o2_length-1:-1, :] # TODO(h): exclude the last step (which is a prediction)
-        #assert all_logits.shape[1] == o1_onehot.shape[1] + o2_length
-        #assert o2_logits.shape[1] == o2_length
+        # ====
+        inputs_embeds = get_input_embeds(model.get_input_embeddings(),
+                                         perturbed_logits[0] / temperature, # temperature
+                                         o1_onehot=o1_onehot,
+                                         #o2_onehot=o2_onehot,
+                                         device=device)
+        all_logits, _, _ = model(inputs_embeds=inputs_embeds)
+        o2_length = o2_onehot.shape[1]
+        o2_logits = all_logits[:, -o2_length-1:-1, :] # TODO(h): exclude the last step (which is a prediction)
+        assert all_logits.shape[1] == o1_onehot.shape[1] + o2_length
+        assert o2_logits.shape[1] == o2_length
 
-        ## O2 loss
-        #loss_1 = torch.nn.CrossEntropyLoss()(o2_logits.view(-1, o2_logits.size(-1)), o2.view(-1))
-        loss_1 = 0
+        # O2 loss
+        loss_1 = torch.nn.CrossEntropyLoss()(o2_logits.view(-1, o2_logits.size(-1)), o2.view(-1))
+        #loss_1 = 0
+        # ====
 
         loss_2 = torch.nn.CrossEntropyLoss()(perturbed_logits[0].view(-1, perturbed_logits[0].size(-1)), o2.view(-1))
-        loss = 0.1 * loss_1 + loss_2
-        print("o2 loss:", loss.data.cpu().numpy())
+        loss = 0.5 * loss_1 + loss_2
+        if verbose:
+            print("o2 loss:", loss.data.cpu().numpy())
 
         loss_per_iter.append(loss.data.cpu().numpy())
 
@@ -592,13 +636,13 @@ def perturb_right_to_left(
 
         # calculate gradient norms
         if grad_norms is not None and False: # TODO
-            print('grad_norms 1')
+            #print('grad_norms 1')
             grad_norms = [
                 torch.max(grad_norms[index], torch.norm(p_.grad))
                 for index, p_ in enumerate(curr_perturbation)
             ]
         else:
-            print('grad_norms 2')
+            #print('grad_norms 2')
             grad_norms = [
                 (torch.norm(p_.grad, dim=-1) + SMALL_CONST) for index, p_ in enumerate(curr_perturbation)
             ]
@@ -621,12 +665,13 @@ def perturb_right_to_left(
         ]
 
         topk_grad, topk_index = torch.topk(torch.abs(torch.FloatTensor(grad[0])[0,-5,:]), 5)
-        print(topk_grad.data.cpu().numpy())
-        print(topk_index.data.cpu().numpy())
         grad_temp_norms = [
             torch.norm(torch.FloatTensor(p_), dim=-1) for index, p_ in enumerate(grad)
         ]
-        print(grad_temp_norms[0][0,-5])
+        if verbose:
+            print(topk_grad.data.cpu().numpy())
+            print(topk_index.data.cpu().numpy())
+            print(grad_temp_norms[0][0,-5])
 
         # accumulate gradient
         grad_accumulator = list(map(add, grad, grad_accumulator))
@@ -645,7 +690,8 @@ def perturb_right_to_left(
         _grad_accumulator = [to_var(torch.from_numpy(p_), requires_grad=True, device=device) for p_ in grad_accumulator]
         _pert_logits = list(map(add, logits, _grad_accumulator))
         text = get_text_from_logits(_pert_logits[0], tokenizer, temperature=1.0, top_k=top_k)
-        print("[Backward]: ", text)
+        if verbose:
+            print("[Backward]: ", text)
 
 
     # apply the accumulated perturbations to the past
@@ -668,24 +714,25 @@ if __name__ == "__main__":
     )
     parser.add_argument("--o1_text", type=str, default="Stephen was at a party.", help="o1")
     parser.add_argument("--o2_text", type=str, default="He checked it but it was completely broken.", help="o2")
-    parser.add_argument("--length", type=int, default=10)
-    parser.add_argument("--stepsize", type=float, default=0.02)
-    parser.add_argument("--mix_rate", type=float, default=0.5)
-    parser.add_argument("--temperature_first", type=float, default=1.0)
-    parser.add_argument("--temperature_backward", type=float, default=1.0)
-    parser.add_argument("--temperature_forward", type=float, default=1.0)
-    parser.add_argument("--temperature_o1", type=float, default=0.01)
-    parser.add_argument("--top_k", type=int, default=1)
-    parser.add_argument("--sample", action="store_true")
-    parser.add_argument("--num_passes", type=int, default=3)
-    parser.add_argument("--num_iterations", type=int, default=1)
-    parser.add_argument("--perturb_o1", action="store_true")
-    parser.add_argument("--gamma", type=float, default=1.5)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--length", type=int, default=10, help="Not used for the counterfactual setting.")
+    parser.add_argument("--stepsize", type=float, default=0.02, help="learning rate in the backward pass.")
+    parser.add_argument("--mix_rate", type=float, default=0.5, help="Weight of mixing backward and forward logits in the forward pass.")
+    parser.add_argument("--temperature_first", type=float, default=1.0, help="Temperature of logits used in the initialization pass.")
+    parser.add_argument("--temperature_backward", type=float, default=1.0, help="Temperature of logits used in the backward pass.")
+    parser.add_argument("--temperature_forward", type=float, default=1.0, help="Temperature of logits used in the forward pass.")
+    parser.add_argument("--temperature_o1", type=float, default=0.01, help="Temperature of logits of O1.")
+    parser.add_argument("--top_k", type=int, default=1, help="Top-k sampling from logits.")
+    parser.add_argument("--sample", action="store_true", help="Sampling decoding.")
+    parser.add_argument("--num_passes", type=int, default=3, help="Number of passes to interleave Forward and Backward.")
+    parser.add_argument("--num_iterations", type=int, default=1, help="Number of backpropagation iterations in a Backward pass.")
+    parser.add_argument("--perturb_o1", action="store_true", help="Wheher to perturn o1 when refining H.")
+    parser.add_argument("--gamma", type=float, default=1.5, help="Gradient norm.")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--no_cuda", action="store_true", help="no cuda")
     parser.add_argument(
         "--repetition_penalty", type=float, default=1.0, help="Penalize repetition. More than 1.0 -> less repetition",
     )
+    parser.add_argument("--verbose", action="store_true", help="Print intermediate states to help with tuning / debugging.")
 
     args = parser.parse_args()
     run_story_example(**vars(args))
