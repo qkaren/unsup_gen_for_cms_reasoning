@@ -37,8 +37,10 @@ where each line starting with `[Forward]` is the resulting generation at each pa
 
 Run
 ```
-sh run_test.sh
+sh run_test.sh 0
 ```
+where `0` is the GPU id.
+
 See [code here](https://github.com/qkaren/unsupervised_story/blob/master/main.py#L737) for details of all arguments.
 
 Toggle `--verbose` to control how much you want the program to output intermediate results.
