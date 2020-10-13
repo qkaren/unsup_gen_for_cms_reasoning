@@ -7,3 +7,6 @@ This is the **preliminary** code for the following paper:
 EMNLP 2020*
 
 We're cleaning up the codebase and making documentations, which would be ready soon. Please stay tuned!
+
+
+*The code is adapted from the [Plug-and-Play LM code](https://github.com/huggingface/transformers/tree/master/examples/pplm) developed in [this paper](https://arxiv.org/abs/1912.02164).*
