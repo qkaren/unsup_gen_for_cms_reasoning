@@ -222,6 +222,5 @@ docs/_build
 tmp.txt
 tmp*.txt
 *tmp.txt
-ranking
 good*
 /output*/
