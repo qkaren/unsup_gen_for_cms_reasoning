@@ -500,8 +500,8 @@ if __name__ == "__main__":
     with open(candidate_output, 'w') as fw:
         for r in records:
             # We use O2<E>O1 as the left context. Yet prepending O2 here is
-            # minor to the performance. See the latest paper (section 4.1)
-            # for more details.
+            # minor to the overall performance. See the latest paper
+            # (https://arxiv.org/abs/2010.05906, section 4.1) for more details.
             o1_text = '<|endoftext|>'.join([r['obs2'], r['obs1']])
             o2_text = r['obs2']
 
