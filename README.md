@@ -11,6 +11,9 @@ EMNLP 2020*
 - Ranking code is included in `ranking/`
 - Decoding and ranking results will be put in `output/`
 
+**Note:** *it seems important to use the same versions of pytorch and transformers as listed in `requirements.txt`. Using different versions may produce different generations.*
+
+
 ## Counterfactual Reasoning
 
 ### Decoding
